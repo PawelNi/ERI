@@ -1,0 +1,693 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Windows.Forms;
+
+namespace AStarWinForms
+{
+    public class Form1 : Form
+    {
+        private int[,] _map = new int[20, 20];
+        private int[,] _renderMap = new int[20, 20];
+
+        // x = wiersz, y = kolumna
+        private Point _start = new Point(19, 0);
+        private Point _goal = new Point(0, 19);
+
+        private readonly GridView _gridView;
+        private readonly Button _btnLoad;
+        private readonly Button _btnShowPath;
+        private readonly Button _btnAnimate;
+        private readonly Button _btnReset;
+        private readonly Label _lbl;
+        private readonly NumericUpDown _speedMs;
+
+        private readonly Timer _timer;
+        private AStarStepper _stepper;
+        private bool _running;
+
+        private enum AnimMode { Idle, Searching, Traversing }
+        private AnimMode _mode = AnimMode.Idle;
+
+        private int _travelIndex = 0;
+        private List<Point> _finalPath = null;
+
+        public Form1()
+        {
+            Text = "A* (Agwiazdka) – edycja + animacja";
+            StartPosition = FormStartPosition.CenterScreen;
+            MinimumSize = new Size(920, 580);
+
+            _btnLoad = new Button { Text = "Wczytaj grid.txt", Width = 140, Height = 34 };
+            _btnShowPath = new Button { Text = "Pokaż trasę (szybko)", Width = 170, Height = 34 };
+            _btnAnimate = new Button { Text = "Animuj", Width = 110, Height = 34 };
+            _btnReset = new Button { Text = "Reset", Width = 90, Height = 34 };
+
+            _speedMs = new NumericUpDown
+            {
+                Minimum = 20,
+                Maximum = 1000,
+                Value = 200,   // wolniej, żeby było widać krok->krok
+                Increment = 20,
+                Width = 80
+            };
+
+            _lbl = new Label
+            {
+                AutoSize = true,
+                Text = "LPM: ściana | PPM: czyść | Shift+LPM: start | Ctrl+LPM: cel",
+                Padding = new Padding(6, 9, 6, 6)
+            };
+
+            var top = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                Height = 56,
+                Padding = new Padding(10, 10, 10, 6),
+                WrapContents = false,
+                AutoScroll = true
+            };
+
+            top.Controls.Add(_btnLoad);
+            top.Controls.Add(_btnShowPath);
+            top.Controls.Add(_btnAnimate);
+            top.Controls.Add(_btnReset);
+            top.Controls.Add(new Label { Text = "  prędkość(ms):", AutoSize = true, Padding = new Padding(10, 9, 0, 0) });
+            top.Controls.Add(_speedMs);
+            top.Controls.Add(_lbl);
+
+            _gridView = new GridView { Dock = DockStyle.Fill };
+            _gridView.MouseDown += GridMouseDown;
+
+            Controls.Add(_gridView);
+            Controls.Add(top);
+
+            _btnLoad.Click += (s, e) => LoadFromDialog();
+            _btnShowPath.Click += (s, e) => ShowPathFast();
+            _btnAnimate.Click += (s, e) => ToggleAnimation();
+            _btnReset.Click += (s, e) => ResetRender();
+
+            _speedMs.ValueChanged += (s, e) =>
+            {
+                if (_timer != null) _timer.Interval = (int)_speedMs.Value;
+            };
+
+            _timer = new Timer();
+            _timer.Interval = (int)_speedMs.Value;
+            _timer.Tick += OnTick;
+
+            // auto: grid.txt obok exe
+            string defaultFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "grid.txt");
+            if (File.Exists(defaultFile))
+            {
+                _map = LoadMap(defaultFile);
+                _start = new Point(_map.GetLength(0) - 1, 0);
+                _goal = new Point(0, _map.GetLength(1) - 1);
+            }
+
+            ResetRender();
+        }
+
+        // ================= UI: klik -> ściany/start/cel =================
+
+        private void GridMouseDown(object sender, MouseEventArgs e)
+        {
+            if (_running) return; // podczas animacji nie edytujemy
+
+            Point cell;
+            if (!_gridView.TryHitTest(e.Location, out cell)) return;
+
+            bool shift = (ModifierKeys & Keys.Shift) == Keys.Shift;
+            bool ctrl = (ModifierKeys & Keys.Control) == Keys.Control;
+
+            if (shift)
+            {
+                if (cell == _goal) return;
+                if (_map[cell.X, cell.Y] == 5) _map[cell.X, cell.Y] = 0;
+                _start = cell;
+                ResetRender();
+                return;
+            }
+
+            if (ctrl)
+            {
+                if (cell == _start) return;
+                if (_map[cell.X, cell.Y] == 5) _map[cell.X, cell.Y] = 0;
+                _goal = cell;
+                ResetRender();
+                return;
+            }
+
+            if (cell == _start || cell == _goal) return;
+
+            if (e.Button == MouseButtons.Left)
+            {
+                _map[cell.X, cell.Y] = (_map[cell.X, cell.Y] == 5) ? 0 : 5;
+                ResetRender();
+            }
+            else if (e.Button == MouseButtons.Right)
+            {
+                _map[cell.X, cell.Y] = 0;
+                ResetRender();
+            }
+        }
+
+        // ================= Buttons =================
+
+        private void LoadFromDialog()
+        {
+            if (_running) ToggleAnimation(); // zatrzymaj jeśli leci
+
+            using (var ofd = new OpenFileDialog
+            {
+                Title = "Wybierz plik grid.txt",
+                Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*"
+            })
+            {
+                if (ofd.ShowDialog(this) != DialogResult.OK) return;
+
+                try
+                {
+                    _map = LoadMap(ofd.FileName);
+                    _start = new Point(_map.GetLength(0) - 1, 0);
+                    _goal = new Point(0, _map.GetLength(1) - 1);
+                    ResetRender();
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, ex.Message, "Błąd wczytywania",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+        }
+
+        private void ResetRender()
+        {
+            if (_running)
+            {
+                _timer.Stop();
+                _running = false;
+                _btnAnimate.Text = "Animuj";
+                _mode = AnimMode.Idle;
+            }
+
+            _finalPath = null;
+            _travelIndex = 0;
+            _stepper = null;
+
+            _renderMap = (int[,])_map.Clone();
+            StampStartGoal(_renderMap);
+            _gridView.SetMap(_renderMap);
+
+            _lbl.Text = "LPM: ściana | PPM: czyść | Shift+LPM: start | Ctrl+LPM: cel";
+        }
+
+        private void ShowPathFast()
+        {
+            if (_running) ToggleAnimation(); // zatrzymaj jeśli leci
+
+            var baseMap = (int[,])_map.Clone();
+            HashSet<Point> visited;
+            List<Point> path = AStarStepper.RunToEnd(baseMap, _start, _goal, out visited);
+
+            var render = (int[,])_map.Clone();
+
+            foreach (var p in visited)
+                if (render[p.X, p.Y] != 5) render[p.X, p.Y] = 2;
+
+            if (path != null)
+            {
+                foreach (var p in path)
+                    if (render[p.X, p.Y] == 0 || render[p.X, p.Y] == 2) render[p.X, p.Y] = 3;
+
+                _lbl.Text = "Trasa znaleziona. Długość: " + (path.Count - 1) + " kroków.";
+            }
+            else
+            {
+                _lbl.Text = "Nie znaleziono trasy.";
+            }
+
+            StampStartGoal(render);
+            _renderMap = render;
+            _gridView.SetMap(_renderMap);
+        }
+
+        private void ToggleAnimation()
+        {
+            if (_running)
+            {
+                _timer.Stop();
+                _running = false;
+                _btnAnimate.Text = "Animuj";
+                _mode = AnimMode.Idle;
+                _finalPath = null;
+                _travelIndex = 0;
+                _lbl.Text = "Zatrzymano. Możesz edytować mapę.";
+                return;
+            }
+
+            var baseMap = (int[,])_map.Clone();
+            _stepper = new AStarStepper(baseMap, _start, _goal);
+
+            _finalPath = null;
+            _travelIndex = 0;
+            _mode = AnimMode.Searching;
+
+            _timer.Interval = (int)_speedMs.Value;
+            _timer.Start();
+
+            _running = true;
+            _btnAnimate.Text = "Stop";
+            _lbl.Text = "Animacja: wyszukiwanie A*...";
+        }
+
+        private void OnTick(object sender, EventArgs e)
+        {
+            if (_mode == AnimMode.Searching)
+            {
+                if (_stepper == null) return;
+
+                bool progressed = _stepper.Step();
+                var render = (int[,])_map.Clone();
+
+                foreach (var p in _stepper.Closed)
+                    if (render[p.X, p.Y] != 5) render[p.X, p.Y] = 2; // closed
+
+                foreach (var p in _stepper.Open)
+                    if (render[p.X, p.Y] == 0) render[p.X, p.Y] = 4; // open
+
+                if (_stepper.HasCurrent)
+                {
+                    var c = _stepper.Current;
+                    if (render[c.X, c.Y] != 5) render[c.X, c.Y] = 7; // current
+                }
+
+                if (_stepper.IsFinished)
+                {
+                    if (_stepper.Success && _stepper.Path != null)
+                    {
+                        _finalPath = _stepper.Path;
+                        _travelIndex = 0;
+                        _mode = AnimMode.Traversing;
+
+                        _lbl.Text = "Trasa znaleziona — klocek jedzie do celu...";
+                    }
+                    else
+                    {
+                        _timer.Stop();
+                        _running = false;
+                        _btnAnimate.Text = "Animuj";
+                        _mode = AnimMode.Idle;
+                        _lbl.Text = "Koniec: nie znaleziono trasy.";
+                    }
+                }
+                else if (!progressed)
+                {
+                    _timer.Stop();
+                    _running = false;
+                    _btnAnimate.Text = "Animuj";
+                    _mode = AnimMode.Idle;
+                    _lbl.Text = "Koniec: brak postępu.";
+                }
+
+                StampStartGoal(render);
+                _renderMap = render;
+                _gridView.SetMap(_renderMap);
+                return;
+            }
+
+            if (_mode == AnimMode.Traversing)
+            {
+                if (_finalPath == null || _finalPath.Count == 0)
+                {
+                    _timer.Stop();
+                    _running = false;
+                    _btnAnimate.Text = "Animuj";
+                    _mode = AnimMode.Idle;
+                    _lbl.Text = "Koniec: brak trasy do animacji.";
+                    return;
+                }
+
+                var render = (int[,])_map.Clone();
+
+                // zostaw tło zamkniętych z A*
+                if (_stepper != null)
+                {
+                    foreach (var p in _stepper.Closed)
+                        if (render[p.X, p.Y] != 5) render[p.X, p.Y] = 2;
+                }
+
+                // rysuj ścieżkę
+                for (int i = 0; i < _finalPath.Count; i++)
+                {
+                    var p = _finalPath[i];
+                    if (render[p.X, p.Y] != 5) render[p.X, p.Y] = 3;
+                }
+
+                if (_travelIndex >= _finalPath.Count)
+                {
+                    _timer.Stop();
+                    _running = false;
+                    _btnAnimate.Text = "Animuj";
+                    _mode = AnimMode.Idle;
+                    _lbl.Text = "Koniec: klocek dotarł do celu. Długość: " + (_finalPath.Count - 1) + " kroków.";
+
+                    StampStartGoal(render);
+                    _renderMap = render;
+                    _gridView.SetMap(_renderMap);
+                    return;
+                }
+
+                Point mover = _finalPath[_travelIndex];
+                if (render[mover.X, mover.Y] != 5) render[mover.X, mover.Y] = 6; // poruszający się klocek
+                _travelIndex++;
+
+                StampStartGoal(render);
+                _renderMap = render;
+                _gridView.SetMap(_renderMap);
+                return;
+            }
+        }
+
+        private void StampStartGoal(int[,] render)
+        {
+            if (InBounds(render, _start)) render[_start.X, _start.Y] = 8;
+            if (InBounds(render, _goal)) render[_goal.X, _goal.Y] = 9;
+        }
+
+        // ===================== Map IO =====================
+
+        private static int[,] LoadMap(string file)
+        {
+            string[] lines = File.ReadAllLines(file)
+                                 .Where(l => !string.IsNullOrWhiteSpace(l))
+                                 .ToArray();
+
+            int rows = lines.Length;
+            string[] first = SplitLine(lines[0]);
+            int cols = first.Length;
+
+            int[,] map = new int[rows, cols];
+
+            for (int i = 0; i < rows; i++)
+            {
+                string[] parts = SplitLine(lines[i]);
+                if (parts.Length != cols)
+                    throw new InvalidOperationException("Nierówna liczba kolumn w linii " + (i + 1) + ".");
+
+                for (int j = 0; j < cols; j++)
+                    map[i, j] = int.Parse(parts[j]);
+            }
+            return map;
+        }
+
+        private static string[] SplitLine(string s)
+        {
+            return s.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        private static bool InBounds(int[,] m, Point p)
+        {
+            return p.X >= 0 && p.X < m.GetLength(0) && p.Y >= 0 && p.Y < m.GetLength(1);
+        }
+    }
+
+    // ==========================================================
+    // A* krokowy (do animacji) + opcja RunToEnd (szybko)
+    // ==========================================================
+    internal class AStarStepper
+    {
+        private readonly int[,] _map;
+        private readonly int _rows;
+        private readonly int _cols;
+
+        private readonly Point _start;
+        private readonly Point _goal;
+
+        private readonly List<Point> _open = new List<Point>();
+        private readonly HashSet<Point> _closed = new HashSet<Point>();
+
+        private readonly Point?[,] _parent;
+        private readonly double[,] _g;
+        private readonly double[,] _f;
+
+        private bool _finished;
+        private bool _success;
+
+        private bool _hasCurrent;
+        private Point _current;
+        private List<Point> _path;
+
+        public IEnumerable<Point> Open { get { return _open; } }
+        public IEnumerable<Point> Closed { get { return _closed; } }
+        public bool IsFinished { get { return _finished; } }
+        public bool Success { get { return _success; } }
+        public bool HasCurrent { get { return _hasCurrent; } }
+        public Point Current { get { return _current; } }
+        public List<Point> Path { get { return _path; } }
+
+        public AStarStepper(int[,] map, Point start, Point goal)
+        {
+            _map = map;
+            _rows = map.GetLength(0);
+            _cols = map.GetLength(1);
+
+            _start = start;
+            _goal = goal;
+
+            _parent = new Point?[_rows, _cols];
+            _g = new double[_rows, _cols];
+            _f = new double[_rows, _cols];
+
+            for (int i = 0; i < _rows; i++)
+                for (int j = 0; j < _cols; j++)
+                    _g[i, j] = _f[i, j] = double.MaxValue;
+
+            _g[_start.X, _start.Y] = 0;
+            _f[_start.X, _start.Y] = Heur(_start, _goal);
+            _open.Add(_start);
+        }
+
+        public bool Step()
+        {
+            if (_finished) return false;
+
+            if (_open.Count == 0)
+            {
+                _finished = true;
+                _success = false;
+                return false;
+            }
+
+            _current = TakeBest(_open, _f);
+            _hasCurrent = true;
+
+            if (_current == _goal)
+            {
+                _finished = true;
+                _success = true;
+                _path = Reconstruct(_parent, _current);
+                return true;
+            }
+
+            _closed.Add(_current);
+
+            var neighbors = Neighbors(_current, _map, _rows, _cols);
+            for (int k = 0; k < neighbors.Count; k++)
+            {
+                Point n = neighbors[k];
+                if (_closed.Contains(n)) continue;
+
+                double newG = _g[_current.X, _current.Y] + 1.0;
+
+                if (newG < _g[n.X, n.Y])
+                {
+                    _parent[n.X, n.Y] = _current;
+                    _g[n.X, n.Y] = newG;
+                    _f[n.X, n.Y] = newG + Heur(n, _goal);
+
+                    if (!_open.Contains(n))
+                        _open.Add(n);
+                }
+            }
+
+            return true;
+        }
+
+        public static List<Point> RunToEnd(int[,] map, Point start, Point goal, out HashSet<Point> visitedClosed)
+        {
+            var stepper = new AStarStepper(map, start, goal);
+            while (!stepper.IsFinished)
+                stepper.Step();
+
+            visitedClosed = new HashSet<Point>(stepper._closed);
+            return stepper.Success ? stepper.Path : null;
+        }
+
+        private static double Heur(Point a, Point b)
+        {
+            int dx = a.X - b.X;
+            int dy = a.Y - b.Y;
+            return Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        private static List<Point> Neighbors(Point p, int[,] map, int rows, int cols)
+        {
+            var list = new List<Point>(4);
+            Point[] dirs = { new Point(-1, 0), new Point(1, 0), new Point(0, -1), new Point(0, 1) };
+
+            foreach (Point d in dirs)
+            {
+                int x = p.X + d.X;
+                int y = p.Y + d.Y;
+
+                if (x >= 0 && x < rows && y >= 0 && y < cols && map[x, y] != 5)
+                    list.Add(new Point(x, y));
+            }
+            return list;
+        }
+
+        private static Point TakeBest(List<Point> list, double[,] f)
+        {
+            int bestIdx = 0;
+            for (int i = 1; i < list.Count; i++)
+            {
+                Point p = list[i];
+                Point b = list[bestIdx];
+                if (f[p.X, p.Y] < f[b.X, b.Y])
+                    bestIdx = i;
+            }
+            Point res = list[bestIdx];
+            list.RemoveAt(bestIdx);
+            return res;
+        }
+
+        private static List<Point> Reconstruct(Point?[,] parent, Point pos)
+        {
+            var path = new List<Point>();
+            path.Insert(0, pos);
+
+            while (true)
+            {
+                Point? p = parent[pos.X, pos.Y];
+                if (!p.HasValue) break;
+                pos = p.Value;
+                path.Insert(0, pos);
+            }
+            return path;
+        }
+    }
+
+    // ==========================================================
+    // Rysowanie + hit test (klik w komórkę)
+    // ==========================================================
+    internal sealed class GridView : Control
+    {
+        private int[,] _map;
+
+        // cache układu do hit-testu
+        private int _rows, _cols, _cell, _ox, _oy;
+
+        public GridView()
+        {
+            DoubleBuffered = true;
+            BackColor = Color.White;
+        }
+
+        public void SetMap(int[,] map)
+        {
+            _map = map;
+            Invalidate();
+        }
+
+        public bool TryHitTest(Point mouse, out Point cell)
+        {
+            cell = new Point(-1, -1);
+            if (_map == null) return false;
+
+            if (_cell <= 0) ComputeLayout();
+
+            int x = mouse.X - _ox;
+            int y = mouse.Y - _oy;
+
+            if (x < 0 || y < 0) return false;
+
+            int col = x / _cell;
+            int row = y / _cell;
+
+            if (row < 0 || row >= _rows || col < 0 || col >= _cols) return false;
+
+            // zwracamy (wiersz, kolumna) jako (X, Y)
+            cell = new Point(row, col);
+            return true;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            ComputeLayout();
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (_map == null) return;
+
+            ComputeLayout();
+
+            using (var penGrid = new Pen(Color.FromArgb(220, 220, 220)))
+            using (var framePen = new Pen(Color.FromArgb(90, 90, 90), 2))
+            {
+                for (int i = 0; i < _rows; i++)
+                {
+                    for (int j = 0; j < _cols; j++)
+                    {
+                        Rectangle rect = new Rectangle(_ox + j * _cell, _oy + i * _cell, _cell, _cell);
+                        int v = _map[i, j];
+
+                        using (var b = new SolidBrush(ColorFor(v)))
+                            e.Graphics.FillRectangle(b, rect);
+
+                        e.Graphics.DrawRectangle(penGrid, rect);
+                    }
+                }
+
+                e.Graphics.DrawRectangle(framePen, new Rectangle(_ox, _oy, _cols * _cell, _rows * _cell));
+            }
+        }
+
+        private void ComputeLayout()
+        {
+            if (_map == null) return;
+
+            _rows = _map.GetLength(0);
+            _cols = _map.GetLength(1);
+
+            _cell = Math.Max(10, Math.Min((ClientSize.Width - 20) / _cols,
+                                         (ClientSize.Height - 20) / _rows));
+
+            int gridW = _cols * _cell;
+            int gridH = _rows * _cell;
+
+            _ox = (ClientSize.Width - gridW) / 2;
+            _oy = (ClientSize.Height - gridH) / 2;
+        }
+
+        private static Color ColorFor(int v)
+        {
+            // 0=wolne, 5=ściana, 2=closed, 4=open, 7=current, 3=path, 6=moving, 8=start, 9=goal
+            if (v == 5) return Color.Black;
+            if (v == 3) return Color.Gold;
+            if (v == 6) return Color.DeepSkyBlue;      // poruszający się klocek
+            if (v == 7) return Color.Orange;           // aktualny klocek (podczas szukania)
+            if (v == 4) return Color.Plum;             // lista otwarta
+            if (v == 2) return Color.LightSkyBlue;     // lista zamknięta
+            if (v == 8) return Color.LimeGreen;
+            if (v == 9) return Color.IndianRed;
+            return Color.White;
+        }
+    }
+}
