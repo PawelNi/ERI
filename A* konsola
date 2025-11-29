@@ -1,0 +1,169 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+class Program
+{
+    static int[,] mapa;
+    static int wiersze = 20, kolumny = 20;
+    static (int x, int y) start = (19, 0);
+    static (int x, int y) koniec = (0, 19);
+
+    static void Main(string[] args)
+    {
+        string plik = "grid.txt";
+        mapa = wczytajmape(plik);
+
+        var sciezka = Agwiazdka(mapa, start, koniec);
+
+        if (sciezka == null)
+        {
+            Console.WriteLine("\nNie znaleziono trasy.");
+            return;
+        }
+
+        
+        foreach (var p in sciezka)
+        {
+            if (mapa[p.x, p.y] == 0)
+                mapa[p.x, p.y] = 3;
+        }
+
+        Console.WriteLine("\nZnaleziono trasę:");
+        wyswietlmape(mapa);
+    }
+
+    static int[,] wczytajmape(string plik)
+    {
+        int[,] mapa = new int[wiersze, kolumny];
+        string[] linie = File.ReadAllLines(plik);
+
+        for (int i = 0; i < wiersze; i++)
+        {                  
+            string[] liczby = linie[i].Split(' ');
+
+            for (int j = 0; j < kolumny; j++)
+                mapa[i, j] = int.Parse(liczby[j]);
+        }
+
+        return mapa;
+    }
+
+    static void wyswietlmape(int[,] mapa)
+    {
+        for (int i = 0; i < wiersze; i++)
+        {
+            for (int j = 0; j < kolumny; j++)
+                Console.Write(mapa[i, j] + " ");
+            Console.WriteLine();
+        }
+    }
+
+    static double Euklidesowa((int x, int y) a, (int x, int y) b)
+    {
+        int dx = a.x - b.x;
+        int dy = a.y - b.y;
+        return Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    static List<(int x, int y)> znajdzsomsiad((int x, int y) pole, int[,] mapa)
+    {
+        var somsiad = new List<(int x, int y)>();
+        var szukaj = new (int x, int y)[] { (-1, 0), (1, 0), (0, -1), (0, 1) };
+
+        foreach (var kierunek in szukaj)
+        {
+            int sx = pole.x + kierunek.x;
+            int sy = pole.y + kierunek.y;
+
+            if (sx >= 0 && sx < wiersze && sy >= 0 && sy < kolumny && mapa[sx, sy] != 5)
+                somsiad.Add((sx, sy));
+        }
+        return somsiad;
+    }
+
+    static (int x, int y) weznajlepszy(List<(int x, int y)> lista, double[,] kosztF)
+    {
+        int najlepszyindex = 0;
+
+        for (int i = 1; i < lista.Count; i++)
+        {
+            var punkt = lista[i];
+            var best = lista[najlepszyindex];
+
+            if (kosztF[punkt.x, punkt.y] < kosztF[best.x, best.y])
+                najlepszyindex = i;
+        }
+
+        var wynik = lista[najlepszyindex];
+        lista.RemoveAt(najlepszyindex);
+        return wynik;
+    }
+
+    static List<(int x, int y)> Agwiazdka(int[,] mapa, (int x, int y) start, (int x, int y) koniec)
+    {
+        var listaotwarta = new List<(int x, int y)>();
+        var listazamknieta = new List<(int x, int y)>();
+
+        var rodzic = new (int x, int y)?[wiersze, kolumny];
+        double[,] kosztG = new double[wiersze, kolumny];
+        double[,] kosztF = new double[wiersze, kolumny];
+
+        for (int i = 0; i < wiersze; i++)
+            for (int j = 0; j < kolumny; j++)
+                kosztG[i, j] = kosztF[i, j] = double.MaxValue;
+
+        kosztG[start.x, start.y] = 0;
+        kosztF[start.x, start.y] = Euklidesowa(start, koniec);
+        listaotwarta.Add(start);
+
+        while (listaotwarta.Count > 0)
+        {
+            var pozycja = weznajlepszy(listaotwarta, kosztF);
+
+            if (pozycja.x == koniec.x && pozycja.y == koniec.y)
+                return pokaztrase(rodzic, pozycja);
+
+            if (!listazamknieta.Contains(pozycja))
+                listazamknieta.Add(pozycja);
+
+            foreach (var sasiad in znajdzsomsiad(pozycja, mapa))
+            {
+                if (listazamknieta.Contains(sasiad))
+                    continue;
+
+                double nowyKosztG = kosztG[pozycja.x, pozycja.y] + 1;
+
+                if (nowyKosztG < kosztG[sasiad.x, sasiad.y])
+                {
+                    rodzic[sasiad.x, sasiad.y] = pozycja;
+                    kosztG[sasiad.x, sasiad.y] = nowyKosztG;
+                    kosztF[sasiad.x, sasiad.y] = nowyKosztG + Euklidesowa(sasiad, koniec);
+
+                    if (!listaotwarta.Contains(sasiad))
+                        listaotwarta.Add(sasiad);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    static List<(int x, int y)> pokaztrase((int x, int y)?[,] rodzic, (int x, int y) pozycja)
+    {
+        var sciezka = new List<(int x, int y)>();
+        sciezka.Insert(0, pozycja); 
+
+        while (true)
+        {
+            var punkt = rodzic[pozycja.x, pozycja.y];
+            if (!punkt.HasValue) break;
+
+            pozycja = punkt.Value;
+            sciezka.Insert(0, pozycja); 
+        }
+
+        return sciezka;
+    }
+}
+
